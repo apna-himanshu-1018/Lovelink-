@@ -1,0 +1,680 @@
+name: LoveLink APK
+# GitHub > Actions > "LoveLink APK" > Run workflow dabayein. 5-8 min baad Artifacts mein APK milegi.
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: Project banao aur code lagao
+        run: |
+          flutter create app --org com.lovelink --project-name lovelink --platforms android
+          rm -rf app/test
+          cat > app/pubspec.yaml <<'PUBSPEC_EOF'
+          name: lovelink
+          description: LoveLink - long distance romantic chat for couples (encrypted relay)
+          publish_to: none
+          version: 1.0.0+1
+          environment:
+            sdk: '>=3.3.0 <4.0.0'
+          dependencies:
+            flutter:
+              sdk: flutter
+            crypto: ^3.0.3
+            encrypt: ^5.0.3                   # messages AES se encrypt
+            flutter_local_notifications: ^17.2.4
+            flutter_foreground_task: ^8.0.0   # app background/band hone par bhi chalta rahe
+            permission_handler: ^11.3.1
+            shared_preferences: ^2.2.3
+          flutter:
+            uses-material-design: true
+          PUBSPEC_EOF
+          cat > app/lib/main.dart <<'DART_EOF'
+          // LoveLink 💕 - Long-distance chat for couples (Android)
+          // Transport: encrypted internet relay (ntfy.sh) -> mobile data se kahin se bhi, Wi-Fi/Bluetooth ki zaroorat nahi.
+          import 'dart:async';
+          import 'dart:convert';
+          import 'dart:io';
+          import 'dart:math';
+          import 'dart:typed_data';
+          import 'package:flutter/material.dart';
+          import 'package:flutter/services.dart';
+          import 'package:flutter_foreground_task/flutter_foreground_task.dart';
+          import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+          import 'package:crypto/crypto.dart';
+          import 'package:encrypt/encrypt.dart' as enc;
+          import 'package:permission_handler/permission_handler.dart';
+          import 'package:shared_preferences/shared_preferences.dart';
+
+          // ===== Theme colors: soft pink, rose gold, warm crimson, cream =====
+          const cream = Color(0xFFFFF4EA), blush = Color(0xFFFFD9E2);
+          const rose = Color(0xFFB76E79), crimson = Color(0xFFB3123F), gold = Color(0xFFFFE27A);
+          const kCode = '1018', kMaxWrong = 5, svc = 'com.lovelink.chat';
+          const kBlock = Duration(minutes: 10);
+          int nowMs() => DateTime.now().millisecondsSinceEpoch;
+          String hm(int ms) {
+            final d = DateTime.fromMillisecondsSinceEpoch(ms);
+            return '${d.hour.toString().padLeft(2, '0')}:${d.minute.toString().padLeft(2, '0')}';
+          }
+
+          // ===== Message model: st 0 = sent ✓, 1 = delivered ✓✓, 2 = seen ✓✓(gold) =====
+          class Msg {
+            final String id, from, text;
+            final int ts;
+            int st;
+            Msg(this.id, this.from, this.text, this.ts, [this.st = 0]);
+            Map<String, dynamic> toJson() => {'id': id, 'from': from, 'text': text, 'ts': ts, 'st': st};
+            factory Msg.fromJson(Map j) => Msg(j['id'], j['from'], j['text'], j['ts'], j['st'] ?? 0);
+          }
+
+          // ===== Foreground service: app band/background hone par bhi connection zinda rakhta hai =====
+          @pragma('vm:entry-point')
+          void fgStart() => FlutterForegroundTask.setTaskHandler(_Handler());
+
+          class _Handler extends TaskHandler {
+            @override
+            Future<void> onStart(DateTime timestamp, TaskStarter starter) async {}
+            @override
+            void onRepeatEvent(DateTime timestamp) {}
+            @override
+            Future<void> onDestroy(DateTime timestamp) async {}
+          }
+
+          // ===== Net: login, storage, internet relay (ntfy.sh), encryption, presence, ticks, notifications =====
+          // Partner kitna bhi door ho: dono phone mobile data/internet se ek private "topic" par baat karte hain.
+          // Har message AES se encrypt hota hai (secret shabd se), isliye server par kuch padha nahi ja sakta.
+          class Net extends ChangeNotifier {
+            static final i = Net._();
+            Net._();
+            static const host = 'https://ntfy.sh';
+            late SharedPreferences sp;
+            final fln = FlutterLocalNotificationsPlugin();
+            String? me, partner, secret;
+            String notice = '', _topic = '';
+            List<Msg> msgs = [];
+            DateTime lastPing = DateTime(2000), typingAt = DateTime(2000), _sentTyping = DateTime(2000), _lastLine = DateTime.now();
+            int lastSeen = 0, _sessStart = 0, _n = 0, _gen = 0;
+            final String sid = Random().nextInt(1 << 31).toString(); // is phone-session ki id
+            bool chatOpen = false, _booted = false, live = false;
+            AppLifecycleState life = AppLifecycleState.resumed;
+            Timer? _t1, _t2;
+            HttpClient? _hc;
+            late enc.Key _key;
+
+            bool get ready => me != null && partner != null && (secret ?? '').isNotEmpty;
+            bool get online => live && DateTime.now().difference(lastPing).inSeconds < 70;
+            bool get typing => DateTime.now().difference(typingAt).inSeconds < 5;
+            int get unread => msgs.where((m) => m.from != me && m.st < 2).length;
+
+            Future<void> init() async {
+              sp = await SharedPreferences.getInstance();
+              await fln.initialize(const InitializationSettings(android: AndroidInitializationSettings('@mipmap/ic_launcher')));
+              me = sp.getString('me');
+              if (me != null) { _loadUser(); await boot(); }
+            }
+
+            void _loadUser() {
+              partner = sp.getString('partner:$me');
+              secret = sp.getString('secret:$me');
+              lastSeen = sp.getInt('seen:$me') ?? 0;
+              final s = sp.getString('msgs:$me:$partner');
+              msgs = s == null ? [] : (jsonDecode(s) as List).map((e) => Msg.fromJson(e)).toList();
+              if (ready) { // dono ke number + secret se private topic aur encryption key banti hai
+                final a = [me!, partner!]..sort();
+                _topic = 'lovelink-${sha256.convert(utf8.encode('${a[0]}|${a[1]}|$secret')).toString().substring(0, 32)}';
+                _key = enc.Key(Uint8List.fromList(sha256.convert(utf8.encode('k|$secret')).bytes));
+              }
+            }
+
+            Future<void> _save() => sp.setString('msgs:$me:$partner', jsonEncode(msgs.map((m) => m.toJson()).toList()));
+
+            Future<void> login(String n) async {
+              me = n; notice = '';
+              await sp.setString('me', n);
+              _loadUser();
+              await boot();
+              notifyListeners();
+            }
+
+            Future<void> logout() async {
+              _t1?.cancel(); _t2?.cancel(); _gen++; _hc?.close(force: true); live = false;
+              try { await FlutterForegroundTask.stopService(); } catch (_) {}
+              await sp.remove('me');
+              me = partner = secret = null; msgs = []; _booted = false;
+              notifyListeners();
+            }
+
+            Future<void> setPartner(String n, String sec) async {
+              await sp.setString('partner:$me', n);
+              await sp.setString('secret:$me', sec);
+              _loadUser();
+              _subscribe();
+              notifyListeners();
+            }
+
+            Future<void> boot() async {
+              if (_booted) return;
+              _booted = true; _sessStart = nowMs();
+              await Permission.notification.request();
+              try {
+                FlutterForegroundTask.init(
+                  androidNotificationOptions: AndroidNotificationOptions(channelId: 'lovelink_fg', channelName: 'LoveLink chalu hai'),
+                  iosNotificationOptions: const IOSNotificationOptions(),
+                  foregroundTaskOptions: ForegroundTaskOptions(eventAction: ForegroundTaskEventAction.nothing()),
+                );
+                await FlutterForegroundTask.startService(
+                    notificationTitle: 'LoveLink 💕', notificationText: 'Aapke pyaar se connected', callback: fgStart);
+              } catch (e) { debugPrint('foreground: $e'); }
+              // har 2 sec UI refresh, har ~24 sec "main online hoon" ping
+              _t1 = Timer.periodic(const Duration(seconds: 2), (_) {
+                if (_n++ % 12 == 0) _tx({'t': 'ping'}, cache: false);
+                notifyListeners();
+              });
+              // watchdog: stream chup ho gayi ya toot gayi to dobara jodo
+              _t2 = Timer.periodic(const Duration(seconds: 20), (_) {
+                if (ready && (!live || DateTime.now().difference(_lastLine).inSeconds > 100)) _subscribe();
+              });
+              if (ready) _subscribe();
+            }
+
+            // ----- encryption -----
+            String _enc(String s) {
+              final iv = enc.IV.fromSecureRandom(16);
+              return '${iv.base64}:${enc.Encrypter(enc.AES(_key, mode: enc.AESMode.cbc)).encrypt(s, iv: iv).base64}';
+            }
+
+            String? _dec(String s) {
+              try {
+                final p = s.split(':');
+                return enc.Encrypter(enc.AES(_key, mode: enc.AESMode.cbc)).decrypt64(p[1], iv: enc.IV.fromBase64(p[0]));
+              } catch (_) { return null; }
+            }
+
+            // ----- publish: message server par bhejo (cache:false = sirf live, store nahi hota) -----
+            Future<bool> _tx(Map d, {bool cache = true}) async {
+              if (!ready) return false;
+              try {
+                final c = HttpClient()..connectionTimeout = const Duration(seconds: 8);
+                final r = await c.postUrl(Uri.parse('$host/$_topic'));
+                if (!cache) r.headers.set('Cache', 'no');
+                r.write(_enc(jsonEncode({'f': me, 's': sid, 't0': _sessStart, 'd': d})));
+                final res = await r.close();
+                await res.drain();
+                c.close();
+                return res.statusCode == 200;
+              } catch (_) { return false; }
+            }
+
+            // ----- subscribe: live stream; partner offline tha to 12 ghante ke message wapas mil jaate hain -----
+            Future<void> _subscribe() async {
+              if (!ready) return;
+              final g = ++_gen;
+              try {
+                _hc?.close(force: true);
+                _hc = HttpClient()..connectionTimeout = const Duration(seconds: 10);
+                final since = sp.getInt('since:$me') ?? 0;
+                final req = await _hc!.getUrl(Uri.parse('$host/$_topic/json?since=${since == 0 ? '12h' : since}'));
+                final res = await req.close();
+                live = true; _lastLine = DateTime.now();
+                notifyListeners();
+                _flush();
+                await for (final line in res.transform(utf8.decoder).transform(const LineSplitter())) {
+                  if (g != _gen) return;
+                  _lastLine = DateTime.now();
+                  _rx(line);
+                }
+              } catch (_) {}
+              if (g == _gen) {
+                live = false; notifyListeners();
+                await Future.delayed(const Duration(seconds: 4));
+                if (g == _gen && _booted) _subscribe();
+              }
+            }
+
+            // internet aate hi: bheje nahi gaye messages (⏱) bhejo + purane ticks sync karo
+            void _flush() {
+              for (final m in msgs) { if (m.from == me && m.st < 0) _pub(m); }
+              for (final st in [1, 2]) {
+                final ids = msgs.where((m) => m.from != me && m.st == st).map((m) => m.id).toList();
+                if (ids.isNotEmpty) _tx({'t': 'ack', 'ids': ids, 'st': st});
+              }
+            }
+
+            Future<void> _pub(Msg m) async {
+              if (await _tx({'t': 'msg', 'm': m.toJson()}) && m.st < 0) { m.st = 0; _save(); notifyListeners(); }
+            }
+
+            void _rx(String line) {
+              try {
+                final e = jsonDecode(line);
+                if (e['event'] != 'message') return;
+                final plain = _dec(e['message']);
+                if (plain == null) return;
+                final env = jsonDecode(plain), d = env['d'];
+                if (env['f'] == me) { // mera hi number kisi aur phone par? purana session band (ek number = ek chat box)
+                  if (d['t'] == 'ping' && env['s'] != sid && (env['t0'] as int) > _sessStart) {
+                    notice = 'Aapka number kisi aur phone par khul gaya hai 🚫 Ek number = ek hi chat box.';
+                    logout();
+                  }
+                  return;
+                }
+                if (env['f'] != partner) return;
+                final tSec = e['time'] as int;
+                if (tSec > (sp.getInt('since:$me') ?? 0)) sp.setInt('since:$me', tSec);
+                final fresh = nowMs() ~/ 1000 - tSec < 60; // purane (replay) messages se "online" na dikhao
+                if (fresh) { lastPing = DateTime.now(); lastSeen = nowMs(); sp.setInt('seen:$me', lastSeen); }
+                switch (d['t']) {
+                  case 'msg': _got(Msg.fromJson(d['m'])); break;
+                  case 'ack':
+                    for (final m in msgs) { if (m.from == me && (d['ids'] as List).contains(m.id) && d['st'] > m.st) m.st = d['st']; }
+                    _save(); break;
+                  case 'typing': if (fresh) typingAt = DateTime.now(); break;
+                }
+                notifyListeners();
+              } catch (_) {}
+            }
+
+            void _got(Msg m) {
+              if (m.from != partner) return;
+              final ex = msgs.where((x) => x.id == m.id);
+              if (ex.isNotEmpty) { _tx({'t': 'ack', 'ids': [m.id], 'st': ex.first.st}); return; }
+              final viewing = chatOpen && life == AppLifecycleState.resumed;
+              m.st = viewing ? 2 : 1; // chat khuli hai -> seen, warna delivered
+              msgs.add(m); _save();
+              _tx({'t': 'ack', 'ids': [m.id], 'st': m.st});
+              if (!viewing) _notify(m.text);
+            }
+
+            void markSeen() {
+              final ids = <String>[];
+              for (final m in msgs) { if (m.from != me && m.st < 2) { m.st = 2; ids.add(m.id); } }
+              if (ids.isNotEmpty) { _save(); _tx({'t': 'ack', 'ids': ids, 'st': 2}); notifyListeners(); }
+            }
+
+            void send(String text) {
+              final m = Msg('${DateTime.now().microsecondsSinceEpoch}$me', me!, text, nowMs(), -1); // -1 = bhejna baaki ⏱
+              msgs.add(m); _save();
+              _pub(m);
+              notifyListeners();
+            }
+
+            void typingPing() {
+              if (DateTime.now().difference(_sentTyping).inMilliseconds > 3000) { _sentTyping = DateTime.now(); _tx({'t': 'typing'}, cache: false); }
+            }
+
+            void delete(String id) { msgs.removeWhere((m) => m.id == id); _save(); notifyListeners(); }
+
+            Future<void> _notify(String text) => fln.show(
+                  Random().nextInt(100000), 'LoveLink 💕  +91 $partner', text,
+                  const NotificationDetails(
+                      android: AndroidNotificationDetails('lovelink_msgs', 'Messages',
+                          importance: Importance.max, priority: Priority.high, playSound: true, enableVibration: true)));
+          }
+
+          // ===== App =====
+          void main() async {
+            WidgetsFlutterBinding.ensureInitialized();
+            await Net.i.init();
+            runApp(const App());
+          }
+
+          class App extends StatefulWidget {
+            const App({super.key});
+            @override
+            State<App> createState() => _AppState();
+          }
+
+          class _AppState extends State<App> with WidgetsBindingObserver {
+            @override
+            void initState() { super.initState(); WidgetsBinding.instance.addObserver(this); }
+            @override
+            void dispose() { WidgetsBinding.instance.removeObserver(this); super.dispose(); }
+            @override
+            void didChangeAppLifecycleState(AppLifecycleState s) {
+              Net.i.life = s;
+              if (s == AppLifecycleState.resumed && Net.i.chatOpen) Net.i.markSeen();
+            }
+
+            @override
+            Widget build(BuildContext context) => MaterialApp(
+                  title: 'LoveLink',
+                  debugShowCheckedModeBanner: false,
+                  theme: ThemeData(
+                    useMaterial3: true,
+                    colorScheme: ColorScheme.fromSeed(seedColor: crimson, surface: cream),
+                    scaffoldBackgroundColor: cream,
+                  ),
+                  home: ListenableBuilder(listenable: Net.i, builder: (_, __) => Net.i.me == null ? const Login() : const Home()),
+                );
+          }
+
+          PreferredSizeWidget bar(Widget title, {List<Widget>? actions}) => AppBar(
+                title: title, actions: actions, foregroundColor: Colors.white, backgroundColor: Colors.transparent,
+                flexibleSpace: Container(
+                    decoration: const BoxDecoration(gradient: LinearGradient(colors: [crimson, Color(0xFFD4687A), rose]))),
+              );
+
+          // ===== Login: mobile number + fixed code 1018 + 5 galat -> 10 min block =====
+          class Login extends StatefulWidget {
+            const Login({super.key});
+            @override
+            State<Login> createState() => _LoginState();
+          }
+
+          class _LoginState extends State<Login> {
+            final ph = TextEditingController(), cd = TextEditingController();
+            bool step2 = false;
+            String msg = Net.i.notice;
+            int left = 0;
+            Timer? t;
+            SharedPreferences get sp => Net.i.sp;
+            int _until(String n) => sp.getInt('until:$n') ?? 0;
+
+            @override
+            void dispose() { t?.cancel(); super.dispose(); }
+
+            void _tick(String n) {
+              t?.cancel();
+              void f() {
+                final l = (_until(n) - nowMs()) ~/ 1000;
+                if (l <= 0) {
+                  t?.cancel(); sp.setInt('until:$n', 0); sp.setInt('fails:$n', 0);
+                  setState(() { left = 0; step2 = false; msg = 'Block khatam. Dobara try karein 💕'; });
+                } else { setState(() => left = l); }
+              }
+              f();
+              t = Timer.periodic(const Duration(seconds: 1), (_) => f());
+            }
+
+            void next() {
+              final n = ph.text.trim();
+              if (!RegExp(r'^\d{10}$').hasMatch(n)) { setState(() => msg = 'Sahi 10-digit number daalein 💗'); return; }
+              if (_until(n) > nowMs()) { _tick(n); return; }
+              setState(() { step2 = true; msg = ''; });
+            }
+
+            void verify() {
+              final n = ph.text.trim();
+              if (_until(n) > nowMs()) { _tick(n); return; }
+              if (cd.text.trim() == kCode) { sp.setInt('fails:$n', 0); Net.i.login(n); return; }
+              final f = (sp.getInt('fails:$n') ?? 0) + 1;
+              cd.clear();
+              if (f > kMaxWrong) { // 5 se zyada galat -> 10 minute block
+                sp.setInt('until:$n', nowMs() + kBlock.inMilliseconds); sp.setInt('fails:$n', 0); _tick(n); return;
+              }
+              sp.setInt('fails:$n', f);
+              setState(() => msg = '⚠️ Galat code! ($f/$kMaxWrong)${f == kMaxWrong ? ' Agli galat entry par 10 minute ke liye block.' : ''}');
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              final blocked = left > 0;
+              final mm = (left ~/ 60).toString().padLeft(2, '0'), ss = (left % 60).toString().padLeft(2, '0');
+              return Scaffold(
+                body: Container(
+                  decoration: const BoxDecoration(
+                      gradient: LinearGradient(begin: Alignment.topLeft, end: Alignment.bottomRight, colors: [Color(0xFFFFC9D6), cream, Color(0xFFF6D2C4)])),
+                  child: Center(
+                    child: SingleChildScrollView(
+                      padding: const EdgeInsets.all(24),
+                      child: Card(
+                        color: const Color(0xFFFFFDFB), elevation: 8, shadowColor: crimson.withOpacity(.4),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(28)),
+                        child: Padding(
+                          padding: const EdgeInsets.all(24),
+                          child: Column(mainAxisSize: MainAxisSize.min, children: [
+                            Text(blocked ? '💔' : (step2 ? '🔐' : '💖'), style: const TextStyle(fontSize: 60)),
+                            const Text('LoveLink', style: TextStyle(fontFamily: 'serif', fontStyle: FontStyle.italic, fontSize: 32, color: crimson, fontWeight: FontWeight.w600)),
+                            const SizedBox(height: 4),
+                            Text(blocked ? 'Number block hai. Thodi der rukein.' : 'Sirf aap dono ki, bina internet wali duniya',
+                                textAlign: TextAlign.center, style: const TextStyle(color: rose)),
+                            const SizedBox(height: 16),
+                            if (blocked)
+                              Text('$mm:$ss', style: const TextStyle(fontFamily: 'serif', fontSize: 52, color: crimson, fontWeight: FontWeight.bold))
+                            else if (!step2)
+                              _field(ph, '📱 Mobile number (10 digit)', 10, false)
+                            else
+                              _field(cd, '••••', 4, true),
+                            if (msg.isNotEmpty) Padding(padding: const EdgeInsets.only(top: 8), child: Text(msg, textAlign: TextAlign.center, style: const TextStyle(color: crimson))),
+                            const SizedBox(height: 12),
+                            if (!blocked)
+                              SizedBox(width: double.infinity, child: FilledButton(
+                                  style: FilledButton.styleFrom(backgroundColor: crimson, padding: const EdgeInsets.all(14)),
+                                  onPressed: step2 ? verify : next,
+                                  child: Text(step2 ? 'Verify karein 💘' : 'Code daalne chalein 💌'))),
+                            if (step2 && !blocked) TextButton(onPressed: () => setState(() { step2 = false; msg = ''; }), child: const Text('Number badlein')),
+                          ]),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              );
+            }
+
+            Widget _field(TextEditingController c, String hint, int max, bool code) => TextField(
+                  controller: c, keyboardType: TextInputType.number, maxLength: max, obscureText: false,
+                  textAlign: code ? TextAlign.center : TextAlign.start,
+                  style: TextStyle(fontSize: code ? 26 : 16, letterSpacing: code ? 12 : 0),
+                  inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                  decoration: InputDecoration(
+                      counterText: '', hintText: hint, filled: true, fillColor: Colors.white,
+                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(16), borderSide: const BorderSide(color: rose))),
+                );
+          }
+
+          // ===== Home: WhatsApp jaisi chat list (partner ki ek chat) =====
+          class Home extends StatelessWidget {
+            const Home({super.key});
+
+            Future<void> askPartner(BuildContext c) async {
+              final a = TextEditingController(text: Net.i.partner), b = TextEditingController(text: Net.i.secret);
+              final ok = await showDialog<bool>(
+                  context: c,
+                  builder: (_) => AlertDialog(
+                        title: const Text('Partner se jodein 💑'),
+                        content: Column(mainAxisSize: MainAxisSize.min, children: [
+                          TextField(controller: a, keyboardType: TextInputType.number, maxLength: 10,
+                              inputFormatters: [FilteringTextInputFormatter.digitsOnly], decoration: const InputDecoration(hintText: 'Partner ka mobile number')),
+                          TextField(controller: b, decoration: const InputDecoration(hintText: 'Dono ka same secret shabd 🔑', helperText: 'Dono phone mein bilkul same likhein')),
+                        ]),
+                        actions: [TextButton(onPressed: () => Navigator.pop(c, true), child: const Text('Save'))],
+                      ));
+              if (ok == true && a.text.length == 10 && a.text != Net.i.me && b.text.trim().isNotEmpty) Net.i.setPartner(a.text, b.text.trim());
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              final n = Net.i;
+              final last = n.msgs.isEmpty ? null : n.msgs.last;
+              return Scaffold(
+                appBar: bar(const Text('LoveLink 💕', style: TextStyle(fontFamily: 'serif', fontStyle: FontStyle.italic)), actions: [
+                  PopupMenuButton<String>(
+                    iconColor: Colors.white,
+                    onSelected: (v) => v == 'p' ? askPartner(context) : n.logout(),
+                    itemBuilder: (_) => const [PopupMenuItem(value: 'p', child: Text('Partner badlein')), PopupMenuItem(value: 'l', child: Text('Logout'))],
+                  )
+                ]),
+                body: !n.ready
+                    ? Center(child: FilledButton.icon(
+                        style: FilledButton.styleFrom(backgroundColor: crimson),
+                        onPressed: () => askPartner(context), icon: const Icon(Icons.favorite), label: const Text('Partner ka number daalein')))
+                    : Column(children: [
+                        Container(
+                          width: double.infinity, padding: const EdgeInsets.all(8), color: blush,
+                          child: Text(!n.live ? '⚠️ Internet/mobile data nahi hai. Message ⏱ mein rukenge, net aate hi chale jayenge' : n.online ? '💞 Partner online hai' : '📡 Connected. Partner abhi online nahi',
+                              textAlign: TextAlign.center, style: const TextStyle(color: crimson, fontSize: 12)),
+                        ),
+                        ListTile(
+                          leading: const CircleAvatar(backgroundColor: blush, child: Text('💗')),
+                          title: Text('+91 ${n.partner}', style: const TextStyle(fontWeight: FontWeight.bold)),
+                          subtitle: Row(children: [
+                            if (last != null && last.from == n.me) Padding(padding: const EdgeInsets.only(right: 4), child: Icon(last.st < 0 ? Icons.access_time : last.st == 0 ? Icons.done : Icons.done_all, size: 16, color: last.st == 2 ? Colors.amber : Colors.grey)),
+                            Expanded(child: Text(last?.text ?? 'Chat shuru karein 💌', maxLines: 1, overflow: TextOverflow.ellipsis)),
+                          ]),
+                          trailing: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+                            if (last != null) Text(hm(last.ts), style: const TextStyle(fontSize: 12, color: rose)),
+                            if (n.unread > 0) Container(margin: const EdgeInsets.only(top: 4), padding: const EdgeInsets.all(6), decoration: const BoxDecoration(color: crimson, shape: BoxShape.circle),
+                                child: Text('${n.unread}', style: const TextStyle(color: Colors.white, fontSize: 11))),
+                          ]),
+                          onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => const ChatPage())),
+                        ),
+                      ]),
+              );
+            }
+          }
+
+          // ===== Chat page: bubbles, ticks, typing, online / last seen =====
+          class ChatPage extends StatefulWidget {
+            const ChatPage({super.key});
+            @override
+            State<ChatPage> createState() => _ChatState();
+          }
+
+          class _ChatState extends State<ChatPage> {
+            final ctl = TextEditingController(), sc = ScrollController();
+            @override
+            void initState() { super.initState(); Net.i.chatOpen = true; Net.i.markSeen(); }
+            @override
+            void dispose() { Net.i.chatOpen = false; super.dispose(); }
+
+            String day(int ms) {
+              final d = DateTime.fromMillisecondsSinceEpoch(ms), n = DateTime.now();
+              final diff = DateTime(n.year, n.month, n.day).difference(DateTime(d.year, d.month, d.day)).inDays;
+              return diff == 0 ? 'Aaj' : diff == 1 ? 'Kal' : '${d.day}/${d.month}/${d.year}';
+            }
+
+            void sendIt() {
+              final t = ctl.text.trim();
+              if (t.isEmpty) return;
+              Net.i.send(t); ctl.clear();
+            }
+
+            @override
+            Widget build(BuildContext context) => ListenableBuilder(
+                  listenable: Net.i,
+                  builder: (_, __) {
+                    final n = Net.i;
+                    if (n.chatOpen && n.unread > 0) WidgetsBinding.instance.addPostFrameCallback((_) => n.markSeen());
+                    WidgetsBinding.instance.addPostFrameCallback((_) { if (sc.hasClients) sc.jumpTo(sc.position.maxScrollExtent); });
+                    final status = n.typing ? 'typing... ✍️' : n.online ? 'online' : n.lastSeen > 0 ? 'last seen ${hm(n.lastSeen)}' : 'offline';
+                    return Scaffold(
+                      appBar: bar(Row(children: [
+                        const CircleAvatar(radius: 18, backgroundColor: blush, child: Text('💗')),
+                        const SizedBox(width: 10),
+                        Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                          Text('+91 ${n.partner}', style: const TextStyle(fontSize: 16)),
+                          Text(status, style: TextStyle(fontSize: 12, color: n.online ? const Color(0xFF9CFFC4) : Colors.white70)),
+                        ]),
+                      ])),
+                      body: Column(children: [
+                        Expanded(
+                          child: ListView.builder(
+                            controller: sc, padding: const EdgeInsets.all(12), itemCount: n.msgs.length,
+                            itemBuilder: (_, i) {
+                              final m = n.msgs[i], mine = m.from == n.me;
+                              final newDay = i == 0 || day(n.msgs[i - 1].ts) != day(m.ts);
+                              return Column(children: [
+                                if (newDay) Container(margin: const EdgeInsets.symmetric(vertical: 8), padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                                    decoration: BoxDecoration(color: blush, borderRadius: BorderRadius.circular(12)), child: Text(day(m.ts), style: const TextStyle(color: crimson, fontSize: 12))),
+                                Align(
+                                  alignment: mine ? Alignment.centerRight : Alignment.centerLeft,
+                                  child: GestureDetector(
+                                    onLongPress: () => showModalBottomSheet(context: context, builder: (_) => SafeArea(child: Wrap(children: [
+                                          ListTile(leading: const Icon(Icons.copy), title: const Text('Copy'), onTap: () { Clipboard.setData(ClipboardData(text: m.text)); Navigator.pop(context); }),
+                                          ListTile(leading: const Icon(Icons.delete, color: crimson), title: const Text('Mere liye delete'), onTap: () { n.delete(m.id); Navigator.pop(context); }),
+                                        ]))),
+                                    child: Container(
+                                      margin: const EdgeInsets.symmetric(vertical: 3),
+                                      constraints: BoxConstraints(maxWidth: MediaQuery.of(context).size.width * .78),
+                                      padding: const EdgeInsets.fromLTRB(14, 9, 12, 6),
+                                      decoration: BoxDecoration(
+                                        gradient: mine ? const LinearGradient(colors: [Color(0xFFE0556F), crimson]) : null,
+                                        color: mine ? null : Colors.white,
+                                        borderRadius: BorderRadius.only(topLeft: const Radius.circular(18), topRight: const Radius.circular(18),
+                                            bottomLeft: Radius.circular(mine ? 18 : 4), bottomRight: Radius.circular(mine ? 4 : 18)),
+                                        boxShadow: [BoxShadow(color: rose.withOpacity(.2), blurRadius: 6)],
+                                      ),
+                                      child: Column(crossAxisAlignment: CrossAxisAlignment.end, mainAxisSize: MainAxisSize.min, children: [
+                                        Text(m.text, style: TextStyle(fontSize: 15.5, color: mine ? Colors.white : const Color(0xFF4A2A30))),
+                                        const SizedBox(height: 2),
+                                        Row(mainAxisSize: MainAxisSize.min, children: [
+                                          Text(hm(m.ts), style: TextStyle(fontSize: 10, color: mine ? Colors.white70 : rose)),
+                                          if (mine) ...[const SizedBox(width: 4), Icon(m.st < 0 ? Icons.access_time : m.st == 0 ? Icons.done : Icons.done_all, size: 15, color: m.st == 2 ? gold : Colors.white70)],
+                                        ]),
+                                      ]),
+                                    ),
+                                  ),
+                                ),
+                              ]);
+                            },
+                          ),
+                        ),
+                        SafeArea(
+                          child: Padding(
+                            padding: const EdgeInsets.fromLTRB(10, 6, 10, 8),
+                            child: Row(children: [
+                              Expanded(child: TextField(
+                                controller: ctl, minLines: 1, maxLines: 4, textCapitalization: TextCapitalization.sentences,
+                                onChanged: (_) => n.typingPing(),
+                                decoration: InputDecoration(hintText: 'Dil ki baat likhein...', filled: true, fillColor: Colors.white,
+                                    contentPadding: const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
+                                    border: OutlineInputBorder(borderRadius: BorderRadius.circular(26), borderSide: BorderSide.none)),
+                              )),
+                              const SizedBox(width: 8),
+                              CircleAvatar(radius: 24, backgroundColor: crimson, child: IconButton(onPressed: sendIt, icon: const Icon(Icons.favorite, color: Colors.white))),
+                            ]),
+                          ),
+                        ),
+                      ]),
+                    );
+                  },
+                );
+          }
+          DART_EOF
+          cat > patch.py <<'PY_EOF'
+          import re, glob
+          root = 'app/android/app'
+          # ---- AndroidManifest: permissions + foreground service + app name ----
+          mp = root + '/src/main/AndroidManifest.xml'
+          m = open(mp, encoding='utf-8').read()
+          perms = """<uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <uses-permission android:name="android.permission.VIBRATE"/>
+              <uses-permission android:name="android.permission.WAKE_LOCK"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>"""
+          m = m.replace('<application', perms + '\n    <application', 1)
+          svc = '<service android:name="com.pravera.flutter_foreground_task.service.ForegroundService" android:foregroundServiceType="dataSync" android:exported="false"/>'
+          m = m.replace('</application>', '    ' + svc + '\n    </application>', 1)
+          m = re.sub(r'android:label="[^"]*"', 'android:label="LoveLink"', m, 1)
+          open(mp, 'w', encoding='utf-8').write(m)
+          # ---- Gradle: minSdk 26 + core library desugaring ----
+          for gp in glob.glob(root + '/build.gradle*'):
+              g = open(gp, encoding='utf-8').read()
+              kts = gp.endswith('.kts')
+              g = re.sub(r'(minSdk(?:Version)?\s*=?\s*)flutter\.minSdkVersion', r'\g<1>26', g)
+              flag = 'isCoreLibraryDesugaringEnabled = true' if kts else 'coreLibraryDesugaringEnabled true'
+              g = re.sub(r'(compileOptions\s*\{)', r'\1\n        ' + flag, g, 1)
+              g += '\ndependencies {\n    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.0.4")\n}\n'
+              open(gp, 'w', encoding='utf-8').write(g)
+          print('patched')
+          PY_EOF
+          python3 patch.py
+      - name: APK build
+        working-directory: app
+        run: |
+          flutter pub get
+          flutter build apk --release --no-shrink
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LoveLink-APK
+          path: app/build/app/outputs/flutter-apk/app-release.apk
